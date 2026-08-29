@@ -7,9 +7,11 @@ corpus and provenance workflow. Do not copy the skill into this repository.
 
 ## Repository boundary
 
-The reusable control library is owned by the independent local repository at
-`C:\Users\Joon\Projects\pyarroyo`. Do not duplicate its implementation or
-tests here. This repository will pin `pyarroyo` as a Git submodule after a
+The reusable control library is owned by the independent nested repository at
+`C:\Users\Joon\Projects\arroyo-to-influxdb\pyarroyo`. It keeps its own `.git`
+history and is ignored by the parent repository during local co-development.
+Do not duplicate its implementation or tests in the relay repository. This
+repository will register and pin `pyarroyo` as a Git submodule after a
 reproducible remote URL is chosen.
 
 `Manuals/` remains read-only protocol evidence. Derived command catalogs,

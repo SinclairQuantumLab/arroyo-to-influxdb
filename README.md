@@ -7,10 +7,13 @@ control library is completed and qualified.
 
 ## Current stage
 
-The active implementation lives in the independent local `pyarroyo` repository
-at `C:\Users\Joon\Projects\pyarroyo`. It has its own Git history, tests, and
-documentation. A remote and a reproducible Git submodule link will be added
-later; this repository will then pin one reviewed `pyarroyo` commit.
+The active implementation lives in the independent nested `pyarroyo`
+repository at `C:\Users\Joon\Projects\arroyo-to-influxdb\pyarroyo`. It has its
+own `.git` directory, history, tests, and documentation while remaining next to
+the future relay during local co-development. The parent repository ignores
+this directory for now. After a reproducible remote is selected, the directory
+will be registered as a real Git submodule and this repository will pin one
+reviewed `pyarroyo` commit.
 
 No InfluxDB schema, settings, credentials, polling loop, startup wrapper, or
 Supervisor configuration has been selected yet. Those surfaces will be derived
@@ -30,7 +33,7 @@ current Sinclair relay references.
 Run the current offline checks from the library repository:
 
 ```powershell
-cd C:\Users\Joon\Projects\pyarroyo
+cd C:\Users\Joon\Projects\arroyo-to-influxdb\pyarroyo
 uv sync
 uv run ruff check .
 uv run pytest
@@ -71,8 +74,9 @@ continuous operation, deployment, and troubleshooting.
 
 ## Developer's note
 
-The reusable library and relay intentionally have separate Git histories. The
-library owns instrument communication and normalized values; the future relay
-will own acquisition timing, recovery policy, InfluxDB mapping, credentials,
-and deployment. A remote-independent local-path dependency is not committed
-because it would make this repository non-reproducible on another machine.
+The reusable library and relay intentionally have separate Git histories even
+while their working trees are colocated. The library owns instrument
+communication and normalized values; the future relay will own acquisition
+timing, recovery policy, InfluxDB mapping, credentials, and deployment. The
+nested repository is ignored rather than recorded as a local-path dependency,
+because such a dependency would not be reproducible on another machine.

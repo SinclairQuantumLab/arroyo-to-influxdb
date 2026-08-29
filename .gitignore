@@ -12,3 +12,6 @@ logs/
 
 # Vendor manuals are local protocol evidence; do not redistribute by default.
 Manuals/*.pdf
+
+# Independent nested repository until a reproducible remote-backed submodule exists.
+pyarroyo/
