@@ -23,7 +23,7 @@ current Sinclair relay references.
 ## Prerequisites for the qualification stage
 
 - Git
-- Python 3.13 and [`uv`](https://docs.astral.sh/uv/)
+- Python 3.11 or newer and [`uv`](https://docs.astral.sh/uv/)
 - The local `pyarroyo` repository when running offline library checks
 - An explicitly identified Arroyo controller and serial port for later live
   read-only qualification
@@ -37,12 +37,20 @@ cd C:\Users\Joon\Projects\arroyo-to-influxdb\pyarroyo
 uv sync
 uv run ruff check .
 uv run pytest
+uv run python tools/audit_command_surface.py
 ```
 
 The library README records its supported command coverage, safety boundaries,
 and validation status. Commands whose official documentation is incomplete are
 listed there briefly and explained item by item in the library's `docs/`
 evidence files.
+
+The manual review and offline contract stages currently pass for all 296
+normalized forms: 290 have generated typed methods and six documentation-gap
+forms fail before I/O. Runtime metadata carries response shapes, wire units,
+risks, and manual-derived model/firmware/feature availability notes. Live
+read-only qualification remains outstanding, so the relay gate is still
+closed; see `pyarroyo/docs/qualification.md` for the evidence split.
 
 ## Relay development gate
 
