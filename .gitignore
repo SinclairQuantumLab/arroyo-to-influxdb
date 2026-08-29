@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+tmp/
+settings.toml
+imaq-secret/
+logs/
+
+# Vendor manuals are local protocol evidence; do not redistribute by default.
+Manuals/*.pdf
