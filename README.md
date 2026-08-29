@@ -46,9 +46,10 @@ listed there briefly and explained item by item in the library's `docs/`
 evidence files.
 
 The manual review and offline contract stages currently pass for all 296
-normalized forms: 290 have generated typed methods and six documentation-gap
-forms fail before I/O. Runtime metadata carries response shapes, wire units,
-risks, and manual-derived model/firmware/feature availability notes. Live
+normalized forms: 290 map onto 215 generated typed properties/methods and six
+documentation-gap forms fail before I/O. Runtime metadata carries the exact
+manual-to-Python entity mapping, response shapes, wire units, risks, and
+manual-derived model/firmware/feature availability notes. Live
 read-only qualification remains outstanding, so the relay gate is still
 closed; see `pyarroyo/docs/qualification.md` for the evidence split.
 
