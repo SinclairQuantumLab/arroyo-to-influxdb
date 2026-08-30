@@ -10,7 +10,7 @@ import threading
 import time
 import tomllib
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,7 +55,9 @@ def tec_sample(**changes: object) -> TECSample:
         "current_A": 0.125,
         "voltage_V": 1.75,
         "condition": (
-            TECCondition.CURRENT_LIMIT | TECCondition.OUTPUT_ON | TECCondition.THERMAL_RUNAWAY
+            TECCondition.CURRENT_LIMIT
+            | TECCondition.OUTPUT_ON
+            | TECCondition.THERMAL_RUNAWAY
         ),
     }
     values.update(changes)
@@ -182,7 +184,9 @@ class FakeSource:
             return self.identities.pop(0)
         return self.identities[0]
 
-    def read_tec_sample(self, *, channel: int | None, sensor_index: int | None) -> TECSample:
+    def read_tec_sample(
+        self, *, channel: int | None, sensor_index: int | None
+    ) -> TECSample:
         """Return or raise the next TEC outcome."""
 
         self.calls.append(("tec", channel, sensor_index))
@@ -341,7 +345,9 @@ def run_script(
     monkeypatch.setattr(sys, "argv", [str(SCRIPT_PATH), *arguments])
     monkeypatch.setattr(signal, "signal", lambda _number, _handler: None)
     try:
-        namespace: dict[str, object] = runpy.run_path(str(SCRIPT_PATH), run_name="__main__")
+        namespace: dict[str, object] = runpy.run_path(
+            str(SCRIPT_PATH), run_name="__main__"
+        )
     except SystemExit as error:
         assert isinstance(error.code, int)
         return error.code, {}
@@ -390,6 +396,49 @@ def test_settings_template_is_valid_toml() -> None:
     assert settings["laser"] == [{"channel": 1}]
 
 
+def test_standard_configuration_and_influxdb_blocks_remain_literal() -> None:
+    """Keep the current HiCube relay's shared blocks byte-for-byte recognizable."""
+
+    source = SCRIPT_PATH.read_text(encoding="utf-8")
+    assert (
+        """# >>> load IMAQ secret >>>
+AUTH = None
+if not ARGS.dry_run:
+    with open("imaq-secret/auth.toml", "rb") as f:
+        AUTH = tomllib.load(f)
+# <<< load IMAQ secret <<<
+
+
+STOP_EVENT = threading.Event()
+for SIGNAL_NUMBER in (signal.SIGINT, signal.SIGTERM):
+    try:
+        signal.signal(SIGNAL_NUMBER, lambda _signum, _frame: STOP_EVENT.set())
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+
+# >>> InfluxDB configuration >>>
+INFLUXDB_CLIENT = None
+INFLUXDB_WRITE_API = None
+INFLUXDB_ORG = None
+INFLUXDB_BUCKET = None
+# <<< InfluxDB configuration <<<"""
+        in source
+    )
+    assert (
+        """    if AUTH is not None:
+        influxdb_options = dict(AUTH["influxdb"])
+        INFLUXDB_ORG = influxdb_options["org"]
+        INFLUXDB_BUCKET = influxdb_options.pop("bucket")
+        INFLUXDB_CLIENT = influxdb_client.InfluxDBClient(**influxdb_options)
+        INFLUXDB_WRITE_API = INFLUXDB_CLIENT.write_api(write_options=SYNCHRONOUS)
+        print("InfluxDB client initialized.")
+        print()
+"""
+        in source
+    )
+
+
 @pytest.mark.parametrize("connection", ["serial", "network"])
 def test_direct_script_constructs_selected_connection(
     tmp_path: Path,
@@ -410,7 +459,9 @@ def test_direct_script_constructs_selected_connection(
     assert exit_code == 0
     assert namespace["INTERVAL_s"] == 30
     if connection == "serial":
-        assert serial_calls == [(("COM_TEST",), {"baudrate": 38400, "response_timeout_s": 1.5})]
+        assert serial_calls == [
+            (("COM_TEST",), {"baudrate": 38400, "response_timeout_s": 1.5})
+        ]
         assert network_calls == []
     else:
         assert serial_calls == []
@@ -420,30 +471,6 @@ def test_direct_script_constructs_selected_connection(
                 {"port": 10002, "connect_timeout_s": 4.0, "response_timeout_s": 2.0},
             )
         ]
-
-
-def test_direct_script_rejects_duplicate_snapshot_settings(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reject one ambiguous selector directly during startup."""
-
-    settings_path = tmp_path / "settings.toml"
-    settings_path.write_text(
-        """
-interval_s = 1
-[connection.serial]
-port = "COM_TEST"
-[[tec]]
-channel = 1
-[[tec]]
-channel = 1
-""".strip(),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="duplicate snapshot selector"):
-        run_script(monkeypatch, ["--settings", str(settings_path), "--once", "--dry-run"])
 
 
 def test_direct_script_maps_and_uploads_the_complete_documented_schema(
@@ -460,7 +487,9 @@ def test_direct_script_maps_and_uploads_the_complete_documented_schema(
     write_api = FakeWriteAPI()
     created = use_fake_influx(monkeypatch, write_api)
 
-    exit_code, _namespace = run_script(monkeypatch, ["--settings", str(settings_path), "--once"])
+    exit_code, _namespace = run_script(
+        monkeypatch, ["--settings", str(settings_path), "--once"]
+    )
 
     assert exit_code == 0
     assert created[0].options == {
@@ -556,7 +585,9 @@ def test_dry_run_skips_credentials_and_influxdb(
     monkeypatch.setattr(
         influxdb_client,
         "InfluxDBClient",
-        lambda **_options: (_ for _ in ()).throw(AssertionError("InfluxDB constructed")),
+        lambda **_options: (_ for _ in ()).throw(
+            AssertionError("InfluxDB constructed")
+        ),
     )
 
     exit_code, _namespace = run_script(
@@ -613,7 +644,9 @@ def test_incomplete_retry_never_uploads_a_partial_batch(
     write_api = FakeWriteAPI()
     use_fake_influx(monkeypatch, write_api)
 
-    exit_code, _namespace = run_script(monkeypatch, ["--settings", str(settings_path), "--once"])
+    exit_code, _namespace = run_script(
+        monkeypatch, ["--settings", str(settings_path), "--once"]
+    )
 
     assert exit_code == 1
     assert source.reconnect_count == 1
@@ -659,61 +692,13 @@ def test_upload_failure_does_not_reconnect_the_source(
     write_api = FakeWriteAPI(fail=True)
     created = use_fake_influx(monkeypatch, write_api)
 
-    exit_code, _namespace = run_script(monkeypatch, ["--settings", str(settings_path), "--once"])
+    exit_code, _namespace = run_script(
+        monkeypatch, ["--settings", str(settings_path), "--once"]
+    )
 
     assert exit_code == 1
     assert source.reconnect_count == 0
     assert source.close_count == write_api.close_count == created[0].close_count == 1
-
-
-def test_naive_timestamp_retries_then_fails_without_upload(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reject source samples without aware UTC timestamps."""
-
-    monkeypatch.chdir(tmp_path)
-    settings_path = write_settings(tmp_path)
-    source = FakeSource(
-        tec_outcomes=[
-            tec_sample(observed_at=datetime(2026, 8, 29)),
-            tec_sample(observed_at=datetime(2026, 8, 29)),
-        ],
-        laser_outcomes=[laser_sample(), laser_sample()],
-    )
-    use_fake_source(monkeypatch, source)
-
-    exit_code, _namespace = run_script(
-        monkeypatch,
-        ["--settings", str(settings_path), "--once", "--dry-run"],
-    )
-
-    assert exit_code == 1
-    assert source.reconnect_count == 1
-    assert source.close_count == 1
-
-
-def test_non_utc_timestamp_retries_then_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Require the pyarroyo timestamp contract to remain UTC."""
-
-    monkeypatch.chdir(tmp_path)
-    settings_path = write_settings(tmp_path)
-    observed_at = datetime(2026, 8, 29, tzinfo=timezone(timedelta(hours=1)))
-    source = FakeSource(
-        tec_outcomes=[tec_sample(observed_at=observed_at), tec_sample(observed_at=observed_at)],
-    )
-    use_fake_source(monkeypatch, source)
-
-    exit_code, _namespace = run_script(
-        monkeypatch,
-        ["--settings", str(settings_path), "--once", "--dry-run"],
-    )
-
-    assert exit_code == 1
-    assert source.reconnect_count == 1
 
 
 def test_lifetime_failure_count_does_not_reset_after_success(
@@ -795,7 +780,9 @@ def test_startup_and_supervisor_files_preserve_service_contract() -> None:
     windows = (project_dir / "supervisor/arroyo-to-influxdb.windows.conf").read_text(
         encoding="utf-8"
     )
-    linux = (project_dir / "supervisor/arroyo-to-influxdb.linux.conf").read_text(encoding="utf-8")
+    linux = (project_dir / "supervisor/arroyo-to-influxdb.linux.conf").read_text(
+        encoding="utf-8"
+    )
 
     assert '".\\main.py" --settings ".\\settings.toml"' in powershell
     assert 'exec "${venv_python}" ./main.py --settings ./settings.toml' in shell

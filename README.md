@@ -75,11 +75,9 @@ the previously active channel before returning.
 
     Repeat `[[tec]]` or `[[laser]]` for every required channel. The relay reads
     all TEC entries in their listed order, followed by all laser entries in
-    their listed order. A repeated `(subsystem, channel, sensor_index)`
-    selection, both connection tables, neither connection table, or a
-    non-positive interval/timeout/channel/index is a startup error. Direct
-    RS-232 commonly uses 9600 baud; select the value required by the controller
-    configuration instead of assuming the USB default.
+    their listed order. Direct RS-232 commonly uses 9600 baud; select the value
+    required by the controller configuration instead of assuming the USB
+    default.
 
 4. Perform initial testing. First read the real controller and print the exact
    records without loading InfluxDB credentials or contacting InfluxDB:
@@ -214,16 +212,14 @@ Each point uses the aware UTC host timestamp captured by `pyarroyo` immediately
 after the final protocol query for that specific snapshot. It does not use the
 InfluxDB write time or one shared cycle timestamp.
 
-The relay validates the identity, aware timestamp, finite numeric values,
-field types, and configured channel/sensor association before upload. One
-invalid or missing required value rejects the complete cycle. No point from an
-incomplete configured batch is uploaded.
+The relay maps the typed, unit-normalized `pyarroyo` samples directly. It sends
+the batch only after every configured snapshot has been acquired and mapped, so
+no point from an incomplete batch is uploaded.
 
 ## Troubleshooting
 
-- If settings fail to load, confirm there is exactly one connection table, at
-  least one snapshot table, positive numeric settings, and no duplicate
-  snapshot selectors.
+- If settings fail to load, confirm there is one connection table and at least
+  one snapshot table with values supported by the selected controller.
 - If a serial connection fails, confirm the explicitly selected port and baud
   rate. The relay never searches other ports. Arroyo USB virtual-COM commonly
   uses 38400 baud, while direct RS-232 commonly uses 9600 baud.
@@ -257,7 +253,7 @@ evidence gaps rather than silently added to the public contract. None of those
 forms is used by this relay; see
 [`pyarroyo/docs/command-evidence.md`](pyarroyo/docs/command-evidence.md).
 
-The relay has 17 offline whole-script tests covering its settings, both
+The relay has 15 offline whole-script tests covering its settings, both
 connection factories, exact TEC/laser schema, timestamps, complete batches,
 recovery, identity continuity, failure accounting, polling deadlines, cleanup,
 and startup/Supervisor contracts. No attached Arroyo controller, InfluxDB
