@@ -1,0 +1,6 @@
+[submodule "pyarroyo"]
+	path = pyarroyo
+	url = https://github.com/SinclairQuantumLab/pyarroyo.git
+[submodule "imaq-secret"]
+	path = imaq-secret
+	url = https://github.com/SinclairQuantumLab/imaq-secret.git

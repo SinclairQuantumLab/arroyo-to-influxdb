@@ -18,19 +18,19 @@ reproducible remote URL is chosen.
 coverage, API decisions, and library validation belong in `pyarroyo`; relay
 schema and operator deployment documentation belong here after the stage gate.
 
-## Current stage gate
+## Current stage
 
-Do not create `main.py`, an InfluxDB schema, credentials, settings, launchers,
-or Supervisor configuration until both conditions hold:
+On 2026-08-29 the user accepted the reviewed `pyarroyo` direction and
+explicitly authorized relay-app planning and development. The future operator
+contract is being written in `README.md` before implementation so its settings,
+schema, acquisition, recovery, and deployment choices can be reviewed first.
 
-1. the library completion criteria in `README.md` and the `pyarroyo`
-   documentation have been met; and
-2. the user explicitly declares the library satisfactory and authorizes the
-   relay-app stage.
-
-Passing offline tests alone does not satisfy the live-hardware criterion. Keep
-manual-reviewed, offline-tested, live-read-tested, and
-live-state-change-tested evidence distinct.
+Relay code and offline tests may now be developed against the independent local
+`pyarroyo` repository. This authorization does not convert offline evidence
+into live evidence and does not authorize an InfluxDB upload, Supervisor
+activation, arbitrary serial probing, or instrument state changes. Keep
+manual-reviewed, offline-tested, live-read-tested, live-upload-tested, and
+live-service-tested evidence distinct.
 
 ## Safety and artifacts
 

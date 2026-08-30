@@ -1,0 +1,23 @@
+# Copy this file to settings.toml and replace the placeholders.
+
+# Seconds between polling-cycle start times.
+interval_s = 30
+
+[connection.serial]
+port = "<PORT>"          # e.g. "COM4" or "/dev/ttyUSB0"
+baudrate = 38400         # Arroyo USB virtual-COM default
+response_timeout_s = 1.0
+
+# To use direct TCP instead, remove [connection.serial] and use:
+# [connection.network]
+# host = "<HOST>"
+# port = 10001
+# connect_timeout_s = 3.0
+# response_timeout_s = 1.0
+
+[[tec]]
+# channel = 1            # Omit to leave the active channel unchanged.
+# sensor_index = 1       # Omit when the controller has one TEC sensor.
+
+[[laser]]
+channel = 1
