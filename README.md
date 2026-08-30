@@ -283,6 +283,8 @@ evidence only; never commit actual endpoint values or device serial numbers.
 - Offline tests execute the production file with
   `runpy.run_path(..., run_name="__main__")` and replace only its source,
   InfluxDB, signal, and timing boundaries.
+- Maintainer handoff, settled decisions, and sanitized live-evidence records
+  are indexed in [`docs/README.md`](docs/README.md).
 - The closest implementation references are the current
   `hicube-neo-to-influxdb` and `seas-pump-to-influxdb` snapshot relays, with
   `LFI3751-to-influxdb` for serial temperature-controller precedent and
