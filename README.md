@@ -3,13 +3,6 @@
 Read configured TEC and laser snapshots from one Arroyo Instruments controller
 through `pyarroyo`, then write them to InfluxDB for Grafana.
 
-> [!IMPORTANT]
-> This README is the implementation contract for the relay now entering
-> development. The relay files and deployment artifacts described below do not
-> exist yet, and the commands are not expected to work until implementation is
-> complete. This notice will be removed only after the repository, tests, and
-> operator instructions agree.
-
 The relay never changes outputs, setpoints, limits, calibration, scripts, saved
 configurations, or event/error registers. An explicitly configured
 multi-channel snapshot temporarily selects its requested channel and restores
@@ -80,8 +73,9 @@ the previously active channel before returning.
     response_timeout_s = 1.0
     ```
 
-    Repeat `[[tec]]` or `[[laser]]` for every required channel. Entries are
-    acquired in file order. A repeated `(subsystem, channel, sensor_index)`
+    Repeat `[[tec]]` or `[[laser]]` for every required channel. The relay reads
+    all TEC entries in their listed order, followed by all laser entries in
+    their listed order. A repeated `(subsystem, channel, sensor_index)`
     selection, both connection tables, neither connection table, or a
     non-positive interval/timeout/channel/index is a startup error. Direct
     RS-232 commonly uses 9600 baud; select the value required by the controller
@@ -109,9 +103,9 @@ the previously active channel before returning.
     Query the new points back from InfluxDB and verify the schema and timestamps
     before starting continuous operation.
 
-5. Optional: after foreground validation, install the matching Supervisor
-   template from `supervisor/` and enable it as described under
-   [Continuous service](#continuous-service).
+5. Optional: after foreground validation, install the matching template from
+   `supervisor/`. It starts the prepared environment through `Startup.ps1` or
+   `Startup.sh` and has `autostart=false` until deliberately enabled.
 
 ## Usage
 
@@ -225,25 +219,6 @@ field types, and configured channel/sensor association before upload. One
 invalid or missing required value rejects the complete cycle. No point from an
 incomplete configured batch is uploaded.
 
-## Continuous service
-
-The repository will provide `Startup.ps1` and `Startup.sh`. Each wrapper changes
-to the repository directory and executes the already prepared `.venv` Python
-directly; it never runs `uv sync` during a service restart.
-
-After a successful foreground dry run and one verified upload:
-
-1. Copy the matching template from `supervisor/` into the platform Supervisor
-   `conf.d` directory and replace its user/path placeholders.
-2. Create the configured log directory if the template does not use an
-   existing Supervisor log path.
-3. Reread Supervisor configuration and enable the program deliberately.
-
-The templates use a five-second successful-start window, five start retries,
-`autorestart=unexpected`, bounded stdout/stderr log rotation, and process-group
-shutdown on Linux. They will ship with `autostart=false` so installing a file
-cannot begin hardware access before operator validation.
-
 ## Troubleshooting
 
 - If settings fail to load, confirm there is exactly one connection table, at
@@ -272,8 +247,9 @@ cannot begin hardware access before operator validation.
 
 ## Validation status
 
-`pyarroyo` has manual-derived coverage and offline wire-contract tests for 290
-of the selected manual's 296 normalized forms. The remaining six laser
+`pyarroyo` has 347 passing offline tests, including manual-derived coverage and
+wire-contract tests for 290 of the selected manual's 296 normalized forms. The
+remaining six laser
 calibration forms are named but not syntactically defined by that manual and
 fail before I/O. The manual's undefined `TEC:VTE?` cross-reference and the
 manufacturer sample's undocumented `TEC:VBULK?` extension are recorded as
@@ -281,33 +257,35 @@ evidence gaps rather than silently added to the public contract. None of those
 forms is used by this relay; see
 [`pyarroyo/docs/command-evidence.md`](pyarroyo/docs/command-evidence.md).
 
-No attached Arroyo controller, InfluxDB upload, startup wrapper, or Supervisor
-service has yet been validated in this workspace. Manual review, library
-offline tests, relay offline tests, live read-only source checks, one-point
-upload verification, and continuous-service validation remain separate evidence
-levels. Update this section with model/firmware-neutral evidence only; never
-commit actual endpoint values or device serial numbers.
+The relay has 17 offline whole-script tests covering its settings, both
+connection factories, exact TEC/laser schema, timestamps, complete batches,
+recovery, identity continuity, failure accounting, polling deadlines, cleanup,
+and startup/Supervisor contracts. No attached Arroyo controller, InfluxDB
+upload, startup wrapper, or Supervisor service has yet been validated in this
+workspace. Manual review, library and relay offline tests, live read-only source
+checks, one-point upload verification, and continuous-service validation remain
+separate evidence levels. Update this section with model/firmware-neutral
+evidence only; never commit actual endpoint values or device serial numbers.
 
 ## Developer's note
 
 - `pyarroyo/` owns transport framing, the manual command API, identity parsing,
   normalized TEC/laser samples, condition flags, and channel restoration.
-- `main.py` will own settings validation, polling deadlines, reconnect policy,
-  identity continuity, fixed InfluxDB mapping, credentials, signals, and
-  cleanup. It will remain a direct synchronous relay rather than introducing an
-  application framework.
-- One persistent `ArroyoClient` will read configured snapshots sequentially in
-  settings-file order. Source recovery discards an incomplete batch,
+- `main.py` is one direct, top-level synchronous sequence for settings,
+  credentials, connection, acquisition, mapping, upload, scheduling, signals,
+  and cleanup. It contains no application classes, helper functions, or
+  `main()` wrapper.
+- One persistent `ArroyoClient` reads configured TEC snapshots in listed order,
+  then configured laser snapshots in listed order. Source recovery discards an incomplete batch,
   reconnects and re-identifies the controller, then retries that idempotent
   snapshot batch once; an InfluxDB failure does not reconnect the controller.
-- Polling will use monotonic cycle-start deadlines. An overrun schedules the
+- Polling uses monotonic cycle-start deadlines. An overrun schedules the
   next cycle one full interval later instead of issuing catch-up reads.
-- `supervisor/supervisor_helper.py` and the startup/config templates will follow
+- `supervisor/supervisor_helper.py` and the startup/config templates follow
   the current Sinclair relay family while remaining repository-local.
-- Offline tests will cover settings validation, serial/network client
-  construction, record mapping, condition-bit expansion, timestamps, complete-
-  batch rejection, dry-run credential isolation, reconnect/re-identification,
-  cumulative failures, timing, signal cleanup, and startup-wrapper contracts.
+- Offline tests execute the production file with
+  `runpy.run_path(..., run_name="__main__")` and replace only its source,
+  InfluxDB, signal, and timing boundaries.
 - The closest implementation references are the current
   `hicube-neo-to-influxdb` and `seas-pump-to-influxdb` snapshot relays, with
   `LFI3751-to-influxdb` for serial temperature-controller precedent and

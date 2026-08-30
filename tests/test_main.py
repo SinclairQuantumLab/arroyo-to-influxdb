@@ -1,21 +1,34 @@
+"""Test the direct relay script, schema, policy, and cleanup offline."""
+
 from __future__ import annotations
 
+import ast
+import runpy
+import signal
+import sys
+import threading
+import time
+import tomllib
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import influxdb_client
 import pytest
 
-import main
+import pyarroyo
 from pyarroyo import (
     ArroyoCommunicationError,
-    ArroyoError,
     InstrumentIdentity,
     LaserCondition,
     LaserSample,
     TECCondition,
     TECSample,
 )
+
+SCRIPT_PATH = Path(__file__).parents[1] / "main.py"
+SETTINGS_TEMPLATE_PATH = Path(__file__).parents[1] / "settings.toml.template"
 
 IDENTITY = InstrumentIdentity(
     manufacturer="Arroyo",
@@ -28,34 +41,9 @@ IDENTITY = InstrumentIdentity(
 OBSERVED_AT = datetime(2026, 8, 29, 12, 34, 56, tzinfo=UTC)
 
 
-def write_settings(tmp_path: Path, text: str) -> Path:
-    path = tmp_path / "settings.toml"
-    path.write_text(text, encoding="utf-8")
-    return path
-
-
-def serial_settings(tmp_path: Path, *, interval_s: str = "30") -> Path:
-    return write_settings(
-        tmp_path,
-        f"""
-interval_s = {interval_s}
-
-[connection.serial]
-port = "COM_TEST"
-baudrate = 38400
-response_timeout_s = 1.5
-
-[[tec]]
-channel = 2
-sensor_index = 1
-
-[[laser]]
-channel = 3
-""",
-    )
-
-
 def tec_sample(**changes: object) -> TECSample:
+    """Build one deterministic TEC snapshot."""
+
     values = {
         "observed_at": OBSERVED_AT,
         "channel": 2,
@@ -75,6 +63,8 @@ def tec_sample(**changes: object) -> TECSample:
 
 
 def laser_sample(**changes: object) -> LaserSample:
+    """Build one deterministic laser snapshot."""
+
     values = {
         "observed_at": OBSERVED_AT + timedelta(seconds=1),
         "channel": 3,
@@ -94,532 +84,719 @@ def laser_sample(**changes: object) -> LaserSample:
     return LaserSample(**values)
 
 
+def write_settings(
+    tmp_path: Path,
+    *,
+    interval_s: float = 30,
+    connection: str = "serial",
+) -> Path:
+    """Write synthetic settings for one direct-script execution."""
+
+    if connection == "serial":
+        connection_text = """
+[connection.serial]
+port = "COM_TEST"
+baudrate = 38400
+response_timeout_s = 1.5
+"""
+    else:
+        connection_text = """
+[connection.network]
+host = "controller.local"
+port = 10002
+connect_timeout_s = 4.0
+response_timeout_s = 2.0
+"""
+    settings_path = tmp_path / "settings.toml"
+    settings_path.write_text(
+        f"""
+interval_s = {interval_s}
+{connection_text}
+[[tec]]
+channel = 2
+sensor_index = 1
+
+[[laser]]
+channel = 3
+""".strip(),
+        encoding="utf-8",
+    )
+    return settings_path
+
+
+def write_auth(tmp_path: Path) -> Path:
+    """Write synthetic, nonsecret InfluxDB destination values."""
+
+    auth_path = tmp_path / "imaq-secret" / "auth.toml"
+    auth_path.parent.mkdir()
+    auth_path.write_text(
+        """
+[influxdb]
+url = "http://influxdb.example:8086"
+token = "<SYNTHETIC_TEST_TOKEN>"
+org = "lab"
+bucket = "devices"
+verify_ssl = false
+""".strip(),
+        encoding="utf-8",
+    )
+    return auth_path
+
+
 class FakeSource:
+    """Provide ordered identity and snapshot outcomes to one script run."""
+
     def __init__(
         self,
         *,
-        identity: InstrumentIdentity = IDENTITY,
-        tec: TECSample | Exception | None = None,
-        laser: LaserSample | Exception | None = None,
+        identities: list[InstrumentIdentity] | None = None,
+        tec_outcomes: list[TECSample | Exception] | None = None,
+        laser_outcomes: list[LaserSample | Exception] | None = None,
+        on_laser_read: Callable[[], None] | None = None,
     ) -> None:
-        self.identity = identity
-        self.tec = tec if tec is not None else tec_sample()
-        self.laser = laser if laser is not None else laser_sample()
+        """Store queued outcomes and initialize lifecycle observations."""
+
+        self.identities = identities or [IDENTITY]
+        self.tec_outcomes = tec_outcomes or [tec_sample()]
+        self.laser_outcomes = laser_outcomes or [laser_sample()]
+        self.on_laser_read = on_laser_read
         self.connect_count = 0
         self.reconnect_count = 0
         self.close_count = 0
         self.calls: list[tuple[object, ...]] = []
 
     def connect(self) -> None:
+        """Record initial connection acquisition."""
+
         self.connect_count += 1
 
     def reconnect(self) -> None:
+        """Record one connection replacement."""
+
         self.reconnect_count += 1
 
     def identify(self) -> InstrumentIdentity:
-        return self.identity
+        """Return the next identity while retaining the last for later calls."""
+
+        if len(self.identities) > 1:
+            return self.identities.pop(0)
+        return self.identities[0]
 
     def read_tec_sample(self, *, channel: int | None, sensor_index: int | None) -> TECSample:
+        """Return or raise the next TEC outcome."""
+
         self.calls.append(("tec", channel, sensor_index))
-        if isinstance(self.tec, Exception):
-            raise self.tec
-        return self.tec
-
-    def read_laser_sample(self, *, channel: int | None) -> LaserSample:
-        self.calls.append(("laser", channel))
-        if isinstance(self.laser, Exception):
-            raise self.laser
-        return self.laser
-
-    def close(self) -> None:
-        self.close_count += 1
-
-
-class FakeWriteAPI:
-    def __init__(self, error: Exception | None = None) -> None:
-        self.error = error
-        self.calls: list[dict[str, object]] = []
-        self.close_count = 0
-
-    def write(self, **kwargs: object) -> None:
-        self.calls.append(kwargs)
-        if self.error is not None:
-            raise self.error
-
-    def close(self) -> None:
-        self.close_count += 1
-
-
-class FakeInfluxClient:
-    def __init__(self) -> None:
-        self.close_count = 0
-
-    def close(self) -> None:
-        self.close_count += 1
-
-
-def silence_signal_registration(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(main.signal, "signal", lambda *_args: None)
-
-
-def test_load_settings_normalizes_connection_and_snapshot_order(tmp_path: Path) -> None:
-    path = write_settings(
-        tmp_path,
-        """
-interval_s = 12.5
-
-[connection.network]
-host = "controller.local"
-
-[[laser]]
-channel = 4
-
-[[tec]]
-
-[[tec]]
-channel = 2
-sensor_index = 3
-""",
-    )
-
-    settings = main.load_settings(path)
-
-    assert settings["interval_s"] == 12.5
-    assert settings["connection"] == {
-        "kind": "network",
-        "host": "controller.local",
-        "port": 10001,
-        "connect_timeout_s": 3.0,
-        "response_timeout_s": 1.0,
-    }
-    assert settings["snapshots"] == [
-        {"subsystem": "tec", "channel": None, "sensor_index": None},
-        {"subsystem": "tec", "channel": 2, "sensor_index": 3},
-        {"subsystem": "laser", "channel": 4, "sensor_index": None},
-    ]
-
-
-@pytest.mark.parametrize(
-    "body, match",
-    [
-        ("interval_s = 0\n[connection.serial]\nport = 'COM1'\n[[tec]]\n", "interval_s"),
-        (
-            "interval_s = 1\n[connection.serial]\nport = 'COM1'\n"
-            "[connection.network]\nhost = 'host'\n[[tec]]\n",
-            "exactly one",
-        ),
-        ("interval_s = 1\n[connection.serial]\nport = 'COM1'\n", "at least one"),
-        (
-            "interval_s = 1\n[connection.serial]\nport = 'COM1'\n"
-            "[[laser]]\nchannel = 1\nsensor_index = 1\n",
-            "not supported",
-        ),
-        (
-            "interval_s = 1\n[connection.serial]\nport = 'COM1'\n"
-            "[[tec]]\nchannel = 1\n[[tec]]\nchannel = 1\n",
-            "duplicate",
-        ),
-    ],
-)
-def test_load_settings_rejects_invalid_contract(tmp_path: Path, body: str, match: str) -> None:
-    with pytest.raises(main.SettingsError, match=match):
-        main.load_settings(write_settings(tmp_path, body))
-
-
-def test_create_source_client_passes_exact_serial_and_network_settings(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    serial_factory = SimpleNamespace(calls=[])
-    network_factory = SimpleNamespace(calls=[])
-    monkeypatch.setattr(
-        main.ArroyoClient,
-        "for_serial",
-        lambda *args, **kwargs: serial_factory.calls.append((args, kwargs)) or "serial-client",
-    )
-    monkeypatch.setattr(
-        main.ArroyoClient,
-        "for_network",
-        lambda *args, **kwargs: network_factory.calls.append((args, kwargs)) or "network-client",
-    )
-
-    assert (
-        main.create_source_client(
-            {
-                "kind": "serial",
-                "port": "COM7",
-                "baudrate": 9600,
-                "response_timeout_s": 2.0,
-            }
-        )
-        == "serial-client"
-    )
-    assert (
-        main.create_source_client(
-            {
-                "kind": "network",
-                "host": "controller",
-                "port": 10002,
-                "connect_timeout_s": 4.0,
-                "response_timeout_s": 2.0,
-            }
-        )
-        == "network-client"
-    )
-    assert serial_factory.calls == [(("COM7",), {"baudrate": 9600, "response_timeout_s": 2.0})]
-    assert network_factory.calls == [
-        (
-            ("controller",),
-            {"port": 10002, "connect_timeout_s": 4.0, "response_timeout_s": 2.0},
-        )
-    ]
-
-
-def test_tec_record_matches_documented_schema() -> None:
-    record = main.tec_record(
-        IDENTITY,
-        tec_sample(),
-        {"subsystem": "tec", "channel": 2, "sensor_index": 1},
-    )
-
-    assert record["measurement"] == "arroyo"
-    assert record["tags"] == {
-        "Manufacturer": "Arroyo",
-        "Model": "MODEL",
-        "Serial number": "SERIAL",
-        "Subsystem": "TEC",
-        "Channel": "2",
-        "Sensor index": "1",
-    }
-    assert record["time"] is OBSERVED_AT
-    assert record["fields"] == {
-        "FirmwareVersion": "1.2.3",
-        "Build": "BUILD",
-        "Mode": "T",
-        "OutputEnabled": True,
-        "Condition": 5121,
-        "OutputOnCondition": True,
-        "Current[A]": 0.125,
-        "Voltage[V]": 1.75,
-        "Temperature[degC]": 24.5,
-        "TemperatureSetpoint[degC]": 25.0,
-        "CurrentLimit": True,
-        "VoltageLimit": False,
-        "SensorLimit": False,
-        "TemperatureHighLimit": False,
-        "TemperatureLowLimit": False,
-        "SensorShorted": False,
-        "SensorOpen": False,
-        "TECOpenCircuit": False,
-        "OutOfTolerance": False,
-        "ThermalRunaway": True,
-    }
-
-
-def test_laser_record_matches_documented_schema() -> None:
-    record = main.laser_record(
-        IDENTITY,
-        laser_sample(),
-        {"subsystem": "laser", "channel": 3, "sensor_index": None},
-    )
-
-    assert record["tags"]["Subsystem"] == "Laser"
-    assert record["tags"]["Channel"] == "3"
-    assert "Sensor index" not in record["tags"]
-    assert record["time"] == OBSERVED_AT + timedelta(seconds=1)
-    assert record["fields"] == {
-        "FirmwareVersion": "1.2.3",
-        "Build": "BUILD",
-        "Mode": "I",
-        "OutputEnabled": False,
-        "Condition": 8210,
-        "OutputOnCondition": False,
-        "Current[A]": 0.012,
-        "Voltage[V]": 2.5,
-        "CurrentSetpoint[A]": 0.013,
-        "VoltageSetpoint[V]": 2.6,
-        "CurrentLimit": False,
-        "VoltageLimit": True,
-        "PhotodiodeCurrentLimit": False,
-        "PhotodiodePowerLimit": False,
-        "InterlockDisabled": True,
-        "OpenCircuit": False,
-        "ShortCircuit": False,
-        "OutOfTolerance": False,
-        "ResistanceLimit": True,
-        "TemperatureLimit": False,
-    }
-
-
-@pytest.mark.parametrize(
-    "sample, selector, match",
-    [
-        (
-            tec_sample(observed_at=datetime(2026, 8, 29)),
-            {"subsystem": "tec", "channel": 2, "sensor_index": 1},
-            "aware",
-        ),
-        (
-            tec_sample(observed_at=datetime(2026, 8, 29, tzinfo=timezone(timedelta(hours=1)))),
-            {"subsystem": "tec", "channel": 2, "sensor_index": 1},
-            "UTC",
-        ),
-        (
-            tec_sample(current_A=float("nan")),
-            {"subsystem": "tec", "channel": 2, "sensor_index": 1},
-            "finite",
-        ),
-        (
-            tec_sample(channel=1),
-            {"subsystem": "tec", "channel": 2, "sensor_index": 1},
-            "selector",
-        ),
-    ],
-)
-def test_tec_record_rejects_invalid_or_mismatched_samples(
-    sample: TECSample, selector: dict[str, object], match: str
-) -> None:
-    with pytest.raises(main.SampleValidationError, match=match):
-        main.tec_record(IDENTITY, sample, selector)
-
-
-def test_acquire_records_is_sequential_and_returns_only_a_complete_batch() -> None:
-    source = FakeSource()
-    snapshots = [
-        {"subsystem": "tec", "channel": 2, "sensor_index": 1},
-        {"subsystem": "laser", "channel": 3, "sensor_index": None},
-    ]
-
-    records = main.acquire_records(source, IDENTITY, snapshots)
-
-    assert source.calls == [("tec", 2, 1), ("laser", 3)]
-    assert [record["tags"]["Subsystem"] for record in records] == ["TEC", "Laser"]
-
-    source = FakeSource(laser=ArroyoCommunicationError("incomplete"))
-    with pytest.raises(ArroyoCommunicationError, match="incomplete"):
-        main.acquire_records(source, IDENTITY, snapshots)
-
-
-def test_source_failure_reconnects_reidentifies_and_retries_complete_batch_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = FakeSource()
-    calls = []
-
-    def acquire(*_args: object) -> list[dict[str, object]]:
-        calls.append("acquire")
-        if len(calls) == 1:
-            raise ArroyoCommunicationError("first read failed")
-        return [{"complete": True}]
-
-    monkeypatch.setattr(main, "acquire_records", acquire)
-
-    assert main.acquire_with_recovery(source, IDENTITY, [], "Iteration 1: ") == [{"complete": True}]
-    assert calls == ["acquire", "acquire"]
-    assert source.reconnect_count == 1
-
-
-def test_identity_change_after_reconnect_rejects_retry(monkeypatch: pytest.MonkeyPatch) -> None:
-    changed = InstrumentIdentity("Arroyo", "OTHER", "SERIAL", "1", "B", "raw")
-    source = FakeSource(identity=changed)
-    monkeypatch.setattr(
-        main,
-        "acquire_records",
-        lambda *_args: (_ for _ in ()).throw(ArroyoCommunicationError("failed")),
-    )
-
-    with pytest.raises(ArroyoError, match="identity changed"):
-        main.acquire_with_recovery(source, IDENTITY, [], "Iteration 1: ")
-    assert source.reconnect_count == 1
-
-
-def test_load_influxdb_removes_bucket_before_constructing_client(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    auth_path = tmp_path / "auth.toml"
-    auth_path.write_text(
-        "[influxdb]\nurl = 'https://influx.invalid'\ntoken = 'TOKEN'\norg = 'ORG'\nbucket = 'BUCKET'\n",
-        encoding="utf-8",
-    )
-    created = []
-    write_api = object()
-
-    class Client:
-        def __init__(self, **kwargs: object) -> None:
-            created.append(kwargs)
-
-        def write_api(self, *, write_options: object) -> object:
-            assert write_options is main.SYNCHRONOUS
-            return write_api
-
-    monkeypatch.setattr(main, "AUTH_PATH", auth_path)
-    monkeypatch.setattr(main.influxdb_client, "InfluxDBClient", Client)
-
-    client, actual_write_api, org, bucket = main.load_influxdb()
-
-    assert isinstance(client, Client)
-    assert actual_write_api is write_api
-    assert org == "ORG"
-    assert bucket == "BUCKET"
-    assert created == [{"url": "https://influx.invalid", "token": "TOKEN", "org": "ORG"}]
-
-
-def test_once_dry_run_never_loads_credentials_or_influxdb(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    source = FakeSource()
-    monkeypatch.setattr(main, "create_source_client", lambda _settings: source)
-    monkeypatch.setattr(
-        main,
-        "load_influxdb",
-        lambda: (_ for _ in ()).throw(AssertionError("credentials must remain unopened")),
-    )
-    silence_signal_registration(monkeypatch)
-
-    result = main.run(["--settings", str(serial_settings(tmp_path)), "--once", "--dry-run"])
-
-    assert result == 0
-    assert source.connect_count == 1
-    assert source.close_count == 1
-    assert "Dry-run records, not uploaded" in capsys.readouterr().out
-
-
-def test_once_upload_writes_one_complete_batch_and_closes_every_client(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = FakeSource()
-    influx = FakeInfluxClient()
-    write_api = FakeWriteAPI()
-    monkeypatch.setattr(main, "create_source_client", lambda _settings: source)
-    monkeypatch.setattr(main, "load_influxdb", lambda: (influx, write_api, "ORG", "BUCKET"))
-    silence_signal_registration(monkeypatch)
-
-    result = main.run(["--settings", str(serial_settings(tmp_path)), "--once"])
-
-    assert result == 0
-    assert len(write_api.calls) == 1
-    call = write_api.calls[0]
-    assert call["org"] == "ORG"
-    assert call["bucket"] == "BUCKET"
-    assert len(call["record"]) == 2
-    assert source.close_count == write_api.close_count == influx.close_count == 1
-
-
-def test_upload_failure_does_not_reconnect_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = FakeSource()
-    influx = FakeInfluxClient()
-    write_api = FakeWriteAPI(RuntimeError("upload failed"))
-    monkeypatch.setattr(main, "create_source_client", lambda _settings: source)
-    monkeypatch.setattr(main, "load_influxdb", lambda: (influx, write_api, "ORG", "BUCKET"))
-    silence_signal_registration(monkeypatch)
-
-    result = main.run(["--settings", str(serial_settings(tmp_path)), "--once"])
-
-    assert result == 1
-    assert source.reconnect_count == 0
-    assert source.close_count == write_api.close_count == influx.close_count == 1
-
-
-def test_incomplete_source_batch_retries_once_but_never_uploads_partial_records(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = FakeSource(laser=ArroyoCommunicationError("laser read failed"))
-    influx = FakeInfluxClient()
-    write_api = FakeWriteAPI()
-    monkeypatch.setattr(main, "create_source_client", lambda _settings: source)
-    monkeypatch.setattr(main, "load_influxdb", lambda: (influx, write_api, "ORG", "BUCKET"))
-    silence_signal_registration(monkeypatch)
-
-    result = main.run(["--settings", str(serial_settings(tmp_path)), "--once"])
-
-    assert result == 1
-    assert source.calls == [("tec", 2, 1), ("laser", 3), ("tec", 2, 1), ("laser", 3)]
-    assert source.reconnect_count == 1
-    assert write_api.calls == []
-
-
-def test_lifetime_failures_are_cumulative_across_success(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = FakeSource()
-    outcomes: list[object] = [
-        RuntimeError("failure one"),
-        [{"success": True}],
-        RuntimeError("failure two"),
-        RuntimeError("failure three"),
-    ]
-
-    def acquire(*_args: object) -> list[dict[str, object]]:
-        outcome = outcomes.pop(0)
+        outcome = self.tec_outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
 
-    monkeypatch.setattr(main, "create_source_client", lambda _settings: source)
-    monkeypatch.setattr(main, "acquire_with_recovery", acquire)
-    silence_signal_registration(monkeypatch)
+    def read_laser_sample(self, *, channel: int | None) -> LaserSample:
+        """Return or raise the next laser outcome."""
 
-    result = main.run(
-        ["--settings", str(serial_settings(tmp_path, interval_s="0.001")), "--dry-run"]
+        self.calls.append(("laser", channel))
+        if self.on_laser_read is not None:
+            self.on_laser_read()
+        outcome = self.laser_outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def close(self) -> None:
+        """Record source cleanup."""
+
+        self.close_count += 1
+
+
+class FakeWriteAPI:
+    """Capture synchronous InfluxDB writes and cleanup."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        """Select write behavior and initialize observations."""
+
+        self.fail = fail
+        self.writes: list[tuple[str, str, list[dict[str, object]]]] = []
+        self.close_count = 0
+
+    def write(
+        self,
+        *,
+        bucket: str,
+        org: str,
+        record: list[dict[str, object]],
+    ) -> None:
+        """Capture one complete batch or raise the selected failure."""
+
+        if self.fail:
+            raise RuntimeError("write failed")
+        self.writes.append((bucket, org, record))
+
+    def close(self) -> None:
+        """Record writer cleanup."""
+
+        self.close_count += 1
+
+
+class FakeInfluxClient:
+    """Return one fake writer and expose construction and cleanup state."""
+
+    def __init__(self, write_api: FakeWriteAPI, options: dict[str, object]) -> None:
+        """Store supplied options and initialize cleanup state."""
+
+        self.api = write_api
+        self.options = options
+        self.close_count = 0
+
+    def write_api(self, *, write_options: object) -> FakeWriteAPI:
+        """Return the supplied synchronous writer."""
+
+        assert write_options is not None
+        return self.api
+
+    def close(self) -> None:
+        """Record client cleanup."""
+
+        self.close_count += 1
+
+
+class FakeStopEvent:
+    """Stop continuous runs after deterministic waits."""
+
+    def __init__(self, clock: list[float], *, stop_after_waits: int) -> None:
+        """Share one monotonic clock and configure the wait limit."""
+
+        self.clock = clock
+        self.stop_after_waits = stop_after_waits
+        self.waits: list[float] = []
+        self.requested = False
+
+    def set(self) -> None:
+        """Record a signal-driven stop request."""
+
+        self.requested = True
+
+    def is_set(self) -> bool:
+        """Report a signal request or exhausted wait allowance."""
+
+        return self.requested or len(self.waits) >= self.stop_after_waits
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Record a wait and advance the shared clock."""
+
+        assert timeout is not None
+        self.waits.append(timeout)
+        self.clock[0] += timeout
+        return self.is_set()
+
+
+def use_fake_source(
+    monkeypatch: pytest.MonkeyPatch,
+    source: FakeSource,
+) -> tuple[list[tuple[tuple[object, ...], dict[str, object]]], list[tuple]]:
+    """Replace both Arroyo factories and capture their arguments."""
+
+    serial_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    network_calls: list[tuple] = []
+
+    def for_serial(*args: object, **kwargs: object) -> FakeSource:
+        serial_calls.append((args, kwargs))
+        return source
+
+    def for_network(*args: object, **kwargs: object) -> FakeSource:
+        network_calls.append((args, kwargs))
+        return source
+
+    monkeypatch.setattr(
+        pyarroyo,
+        "ArroyoClient",
+        SimpleNamespace(for_serial=for_serial, for_network=for_network),
+    )
+    return serial_calls, network_calls
+
+
+def use_fake_influx(
+    monkeypatch: pytest.MonkeyPatch,
+    write_api: FakeWriteAPI,
+) -> list[FakeInfluxClient]:
+    """Replace InfluxDB construction and retain every fake client."""
+
+    created: list[FakeInfluxClient] = []
+
+    def influx_factory(**options: object) -> FakeInfluxClient:
+        client = FakeInfluxClient(write_api, options)
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(influxdb_client, "InfluxDBClient", influx_factory)
+    return created
+
+
+def run_script(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: list[str],
+) -> tuple[int, dict[str, object]]:
+    """Execute the production file as a script and capture its exit result."""
+
+    monkeypatch.syspath_prepend(str(SCRIPT_PATH.parent))
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT_PATH), *arguments])
+    monkeypatch.setattr(signal, "signal", lambda _number, _handler: None)
+    try:
+        namespace: dict[str, object] = runpy.run_path(str(SCRIPT_PATH), run_name="__main__")
+    except SystemExit as error:
+        assert isinstance(error.code, int)
+        return error.code, {}
+    return 0, namespace
+
+
+def test_main_is_a_direct_sequential_script() -> None:
+    """Keep production orchestration free of classes, functions, and a main wrapper."""
+
+    source = SCRIPT_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    assert not any(
+        isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        for node in ast.walk(tree)
+    )
+    assert "if __name__" not in source
+    assert "asyncio" not in source
+    assert "await " not in source
+
+
+def test_direct_script_help_preserves_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Expose the three documented command-line options."""
+
+    exit_code, _namespace = run_script(monkeypatch, ["--help"])
+
+    assert exit_code == 0
+    help_text = capsys.readouterr().out
+    assert "--settings" in help_text
+    assert "--once" in help_text
+    assert "--dry-run" in help_text
+
+
+def test_settings_template_is_valid_toml() -> None:
+    """Keep the distributed settings template directly parseable."""
+
+    with SETTINGS_TEMPLATE_PATH.open("rb") as f:
+        settings = tomllib.load(f)
+
+    assert settings["interval_s"] == 30
+    assert settings["connection"]["serial"]["port"] == "<PORT>"
+    assert settings["tec"] == [{}]
+    assert settings["laser"] == [{"channel": 1}]
+
+
+@pytest.mark.parametrize("connection", ["serial", "network"])
+def test_direct_script_constructs_selected_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    connection: str,
+) -> None:
+    """Read trusted settings directly into the selected Arroyo factory."""
+
+    monkeypatch.chdir(tmp_path)
+    settings_path = write_settings(tmp_path, connection=connection)
+    serial_calls, network_calls = use_fake_source(monkeypatch, FakeSource())
+
+    exit_code, namespace = run_script(
+        monkeypatch,
+        ["--settings", str(settings_path), "--once", "--dry-run"],
     )
 
-    assert result == 1
-    assert outcomes == []
+    assert exit_code == 0
+    assert namespace["INTERVAL_s"] == 30
+    if connection == "serial":
+        assert serial_calls == [(("COM_TEST",), {"baudrate": 38400, "response_timeout_s": 1.5})]
+        assert network_calls == []
+    else:
+        assert serial_calls == []
+        assert network_calls == [
+            (
+                ("controller.local",),
+                {"port": 10002, "connect_timeout_s": 4.0, "response_timeout_s": 2.0},
+            )
+        ]
+
+
+def test_direct_script_rejects_duplicate_snapshot_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject one ambiguous selector directly during startup."""
+
+    settings_path = tmp_path / "settings.toml"
+    settings_path.write_text(
+        """
+interval_s = 1
+[connection.serial]
+port = "COM_TEST"
+[[tec]]
+channel = 1
+[[tec]]
+channel = 1
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate snapshot selector"):
+        run_script(monkeypatch, ["--settings", str(settings_path), "--once", "--dry-run"])
+
+
+def test_direct_script_maps_and_uploads_the_complete_documented_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Map both subsystems, exact names, types, flags, tags, and timestamps."""
+
+    monkeypatch.chdir(tmp_path)
+    settings_path = write_settings(tmp_path)
+    write_auth(tmp_path)
+    source = FakeSource()
+    use_fake_source(monkeypatch, source)
+    write_api = FakeWriteAPI()
+    created = use_fake_influx(monkeypatch, write_api)
+
+    exit_code, _namespace = run_script(monkeypatch, ["--settings", str(settings_path), "--once"])
+
+    assert exit_code == 0
+    assert created[0].options == {
+        "url": "http://influxdb.example:8086",
+        "token": "<SYNTHETIC_TEST_TOKEN>",
+        "org": "lab",
+        "verify_ssl": False,
+    }
+    bucket, org, records = write_api.writes[0]
+    assert (bucket, org) == ("devices", "lab")
+    assert len(records) == 2
+    assert records[0] == {
+        "measurement": "arroyo",
+        "tags": {
+            "Manufacturer": "Arroyo",
+            "Model": "MODEL",
+            "Serial number": "SERIAL",
+            "Subsystem": "TEC",
+            "Channel": "2",
+            "Sensor index": "1",
+        },
+        "fields": {
+            "FirmwareVersion": "1.2.3",
+            "Build": "BUILD",
+            "Mode": "T",
+            "OutputEnabled": True,
+            "Condition": 5121,
+            "OutputOnCondition": True,
+            "Current[A]": 0.125,
+            "Voltage[V]": 1.75,
+            "Temperature[degC]": 24.5,
+            "TemperatureSetpoint[degC]": 25.0,
+            "CurrentLimit": True,
+            "VoltageLimit": False,
+            "SensorLimit": False,
+            "TemperatureHighLimit": False,
+            "TemperatureLowLimit": False,
+            "SensorShorted": False,
+            "SensorOpen": False,
+            "TECOpenCircuit": False,
+            "OutOfTolerance": False,
+            "ThermalRunaway": True,
+        },
+        "time": OBSERVED_AT,
+    }
+    assert records[1] == {
+        "measurement": "arroyo",
+        "tags": {
+            "Manufacturer": "Arroyo",
+            "Model": "MODEL",
+            "Serial number": "SERIAL",
+            "Subsystem": "Laser",
+            "Channel": "3",
+        },
+        "fields": {
+            "FirmwareVersion": "1.2.3",
+            "Build": "BUILD",
+            "Mode": "I",
+            "OutputEnabled": False,
+            "Condition": 8210,
+            "OutputOnCondition": False,
+            "Current[A]": 0.012,
+            "Voltage[V]": 2.5,
+            "CurrentSetpoint[A]": 0.013,
+            "VoltageSetpoint[V]": 2.6,
+            "CurrentLimit": False,
+            "VoltageLimit": True,
+            "PhotodiodeCurrentLimit": False,
+            "PhotodiodePowerLimit": False,
+            "InterlockDisabled": True,
+            "OpenCircuit": False,
+            "ShortCircuit": False,
+            "OutOfTolerance": False,
+            "ResistanceLimit": True,
+            "TemperatureLimit": False,
+        },
+        "time": OBSERVED_AT + timedelta(seconds=1),
+    }
+    assert source.close_count == write_api.close_count == created[0].close_count == 1
+
+
+def test_dry_run_skips_credentials_and_influxdb(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Read the source without opening auth.toml or constructing InfluxDB."""
+
+    monkeypatch.chdir(tmp_path)
+    settings_path = write_settings(tmp_path)
+    source = FakeSource()
+    use_fake_source(monkeypatch, source)
+    monkeypatch.setattr(
+        influxdb_client,
+        "InfluxDBClient",
+        lambda **_options: (_ for _ in ()).throw(AssertionError("InfluxDB constructed")),
+    )
+
+    exit_code, _namespace = run_script(
+        monkeypatch,
+        ["--settings", str(settings_path), "--once", "--dry-run"],
+    )
+
+    assert exit_code == 0
+    assert "Dry-run records, not uploaded" in capsys.readouterr().out
+    assert source.connect_count == source.close_count == 1
+
+
+def test_source_failure_reconnects_reidentifies_and_retries_the_complete_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discard an incomplete first attempt and retry all configured snapshots."""
+
+    monkeypatch.chdir(tmp_path)
+    settings_path = write_settings(tmp_path)
+    source = FakeSource(
+        tec_outcomes=[tec_sample(), tec_sample()],
+        laser_outcomes=[ArroyoCommunicationError("first laser read"), laser_sample()],
+    )
+    use_fake_source(monkeypatch, source)
+
+    exit_code, _namespace = run_script(
+        monkeypatch,
+        ["--settings", str(settings_path), "--once", "--dry-run"],
+    )
+
+    assert exit_code == 0
+    assert source.calls == [("tec", 2, 1), ("laser", 3), ("tec", 2, 1), ("laser", 3)]
+    assert source.reconnect_count == 1
+
+
+def test_incomplete_retry_never_uploads_a_partial_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject both acquired TEC points when each laser attempt fails."""
+
+    monkeypatch.chdir(tmp_path)
+    settings_path = write_settings(tmp_path)
+    write_auth(tmp_path)
+    source = FakeSource(
+        tec_outcomes=[tec_sample(), tec_sample()],
+        laser_outcomes=[
+            ArroyoCommunicationError("first laser read"),
+            ArroyoCommunicationError("retry laser read"),
+        ],
+    )
+    use_fake_source(monkeypatch, source)
+    write_api = FakeWriteAPI()
+    use_fake_influx(monkeypatch, write_api)
+
+    exit_code, _namespace = run_script(monkeypatch, ["--settings", str(settings_path), "--once"])
+
+    assert exit_code == 1
+    assert source.reconnect_count == 1
+    assert write_api.writes == []
+
+
+def test_changed_identity_after_reconnect_rejects_the_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refuse to continue when the configured endpoint resolves to another controller."""
+
+    monkeypatch.chdir(tmp_path)
+    settings_path = write_settings(tmp_path)
+    changed = InstrumentIdentity("Arroyo", "OTHER", "SERIAL", "1", "B", "raw")
+    source = FakeSource(
+        identities=[IDENTITY, changed],
+        tec_outcomes=[ArroyoCommunicationError("disconnected")],
+    )
+    use_fake_source(monkeypatch, source)
+
+    exit_code, _namespace = run_script(
+        monkeypatch,
+        ["--settings", str(settings_path), "--once", "--dry-run"],
+    )
+
+    assert exit_code == 1
+    assert source.reconnect_count == 1
+    assert source.calls == [("tec", 2, 1)]
+
+
+def test_upload_failure_does_not_reconnect_the_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep an InfluxDB failure outside the source recovery boundary."""
+
+    monkeypatch.chdir(tmp_path)
+    settings_path = write_settings(tmp_path)
+    write_auth(tmp_path)
+    source = FakeSource()
+    use_fake_source(monkeypatch, source)
+    write_api = FakeWriteAPI(fail=True)
+    created = use_fake_influx(monkeypatch, write_api)
+
+    exit_code, _namespace = run_script(monkeypatch, ["--settings", str(settings_path), "--once"])
+
+    assert exit_code == 1
+    assert source.reconnect_count == 0
+    assert source.close_count == write_api.close_count == created[0].close_count == 1
+
+
+def test_naive_timestamp_retries_then_fails_without_upload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject source samples without aware UTC timestamps."""
+
+    monkeypatch.chdir(tmp_path)
+    settings_path = write_settings(tmp_path)
+    source = FakeSource(
+        tec_outcomes=[
+            tec_sample(observed_at=datetime(2026, 8, 29)),
+            tec_sample(observed_at=datetime(2026, 8, 29)),
+        ],
+        laser_outcomes=[laser_sample(), laser_sample()],
+    )
+    use_fake_source(monkeypatch, source)
+
+    exit_code, _namespace = run_script(
+        monkeypatch,
+        ["--settings", str(settings_path), "--once", "--dry-run"],
+    )
+
+    assert exit_code == 1
+    assert source.reconnect_count == 1
     assert source.close_count == 1
 
 
-def test_polling_uses_cycle_start_deadlines_and_skips_catch_up_reads(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_non_utc_timestamp_retries_then_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = FakeSource()
-    waits: list[float] = []
+    """Require the pyarroyo timestamp contract to remain UTC."""
 
-    class ControlledEvent:
-        def __init__(self) -> None:
-            self.stopped = False
+    monkeypatch.chdir(tmp_path)
+    settings_path = write_settings(tmp_path)
+    observed_at = datetime(2026, 8, 29, tzinfo=timezone(timedelta(hours=1)))
+    source = FakeSource(
+        tec_outcomes=[tec_sample(observed_at=observed_at), tec_sample(observed_at=observed_at)],
+    )
+    use_fake_source(monkeypatch, source)
 
-        def set(self) -> None:
-            self.stopped = True
+    exit_code, _namespace = run_script(
+        monkeypatch,
+        ["--settings", str(settings_path), "--once", "--dry-run"],
+    )
 
-        def is_set(self) -> bool:
-            return self.stopped
+    assert exit_code == 1
+    assert source.reconnect_count == 1
 
-        def wait(self, timeout: float) -> bool:
-            waits.append(timeout)
-            if len(waits) == 2:
-                self.stopped = True
-            return self.stopped
 
-    monotonic_values = iter([100.0, 103.0, 125.0])
-    monkeypatch.setattr(main, "create_source_client", lambda _settings: source)
-    monkeypatch.setattr(main.threading, "Event", ControlledEvent)
-    monkeypatch.setattr(main.time, "monotonic", lambda: next(monotonic_values))
-    silence_signal_registration(monkeypatch)
+def test_lifetime_failure_count_does_not_reset_after_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Reach the cumulative threshold despite one successful middle cycle."""
 
-    result = main.run(["--settings", str(serial_settings(tmp_path, interval_s="10")), "--dry-run"])
+    monkeypatch.chdir(tmp_path)
+    settings_path = write_settings(tmp_path, interval_s=1)
+    source = FakeSource(
+        tec_outcomes=[
+            ArroyoCommunicationError("cycle one"),
+            ArroyoCommunicationError("cycle one retry"),
+            tec_sample(),
+            ArroyoCommunicationError("cycle three"),
+            ArroyoCommunicationError("cycle three retry"),
+            ArroyoCommunicationError("cycle four"),
+            ArroyoCommunicationError("cycle four retry"),
+        ],
+        laser_outcomes=[laser_sample()],
+    )
+    stop_event = FakeStopEvent([0.0], stop_after_waits=99)
+    use_fake_source(monkeypatch, source)
+    monkeypatch.setattr(threading, "Event", lambda: stop_event)
 
-    assert result == 0
-    assert waits == [7.0, 10.0]
-    assert source.calls == [
-        ("tec", 2, 1),
-        ("laser", 3),
-        ("tec", 2, 1),
-        ("laser", 3),
-    ]
+    exit_code, _namespace = run_script(
+        monkeypatch,
+        ["--settings", str(settings_path), "--dry-run"],
+    )
+
+    assert exit_code == 1
+    assert "(3/3 lifetime)" in capsys.readouterr().err
+    assert source.reconnect_count == 3
+    assert source.close_count == 1
+
+
+def test_scheduler_uses_cycle_start_deadlines_and_skips_catch_up_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Subtract acquisition time and wait a full interval after an overrun."""
+
+    monkeypatch.chdir(tmp_path)
+    settings_path = write_settings(tmp_path, interval_s=10)
+    clock = [0.0]
+    durations = [3.0, 12.0]
+
+    def advance_work() -> None:
+        clock[0] += durations.pop(0)
+
+    source = FakeSource(
+        tec_outcomes=[tec_sample(), tec_sample()],
+        laser_outcomes=[laser_sample(), laser_sample()],
+        on_laser_read=advance_work,
+    )
+    stop_event = FakeStopEvent(clock, stop_after_waits=2)
+    use_fake_source(monkeypatch, source)
+    monkeypatch.setattr(threading, "Event", lambda: stop_event)
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+
+    exit_code, _namespace = run_script(
+        monkeypatch,
+        ["--settings", str(settings_path), "--dry-run"],
+    )
+
+    assert exit_code == 0
+    assert stop_event.waits == [7.0, 10.0]
+    assert source.close_count == 1
 
 
 def test_startup_and_supervisor_files_preserve_service_contract() -> None:
-    powershell = (main.PROJECT_DIR / "Startup.ps1").read_text(encoding="utf-8")
-    shell = (main.PROJECT_DIR / "Startup.sh").read_text(encoding="utf-8")
-    windows = (main.PROJECT_DIR / "supervisor/arroyo-to-influxdb.windows.conf").read_text(
-        encoding="utf-8"
-    )
-    linux = (main.PROJECT_DIR / "supervisor/arroyo-to-influxdb.linux.conf").read_text(
-        encoding="utf-8"
-    )
+    """Keep service restarts offline, explicit, and based on the prepared environment."""
 
-    assert "uv sync" not in powershell.split("Run uv sync first.")[-1]
+    project_dir = SCRIPT_PATH.parent
+    powershell = (project_dir / "Startup.ps1").read_text(encoding="utf-8")
+    shell = (project_dir / "Startup.sh").read_text(encoding="utf-8")
+    windows = (project_dir / "supervisor/arroyo-to-influxdb.windows.conf").read_text(
+        encoding="utf-8"
+    )
+    linux = (project_dir / "supervisor/arroyo-to-influxdb.linux.conf").read_text(encoding="utf-8")
+
     assert '".\\main.py" --settings ".\\settings.toml"' in powershell
     assert 'exec "${venv_python}" ./main.py --settings ./settings.toml' in shell
     for config in (windows, linux):

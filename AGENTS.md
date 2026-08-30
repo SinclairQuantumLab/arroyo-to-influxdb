@@ -7,28 +7,25 @@ corpus and provenance workflow. Do not copy the skill into this repository.
 
 ## Repository boundary
 
-The reusable control library is owned by the independent nested repository at
-`C:\Users\Joon\Projects\arroyo-to-influxdb\pyarroyo`. It keeps its own `.git`
-history and is ignored by the parent repository during local co-development.
-Do not duplicate its implementation or tests in the relay repository. This
-repository will register and pin `pyarroyo` as a Git submodule after a
-reproducible remote URL is chosen.
+The reusable control library is owned by the independently published
+`SinclairQuantumLab/pyarroyo` repository and pinned here as the `pyarroyo` Git
+submodule. Its Git directory is managed under the parent repository's
+`.git/modules/`; do not duplicate its implementation or tests in this relay.
 
-`Manuals/` remains read-only protocol evidence. Derived command catalogs,
-coverage, API decisions, and library validation belong in `pyarroyo`; relay
-schema and operator deployment documentation belong here after the stage gate.
+Manual-derived command catalogs, coverage, API decisions, and library
+validation belong in `pyarroyo`; relay schema and operator deployment
+documentation belong here.
 
 ## Current stage
 
 On 2026-08-29 the user accepted the reviewed `pyarroyo` direction and
-explicitly authorized relay-app planning and development. The future operator
-contract is being written in `README.md` before implementation so its settings,
-schema, acquisition, recovery, and deployment choices can be reviewed first.
+explicitly authorized relay-app planning and development. The relay now has an
+offline-tested implementation, while `README.md` remains its operator contract.
 
-Relay code and offline tests may now be developed against the independent local
-`pyarroyo` repository. This authorization does not convert offline evidence
-into live evidence and does not authorize an InfluxDB upload, Supervisor
-activation, arbitrary serial probing, or instrument state changes. Keep
+Further relay and library development must preserve the Git submodule boundary.
+Existing authorization does not convert offline evidence into live evidence and
+does not authorize an InfluxDB upload, Supervisor activation, arbitrary serial
+probing, or instrument state changes. Keep
 manual-reviewed, offline-tested, live-read-tested, live-upload-tested, and
 live-service-tested evidence distinct.
 
