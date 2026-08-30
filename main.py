@@ -9,9 +9,6 @@ import time
 import tomllib
 from pathlib import Path
 
-import influxdb_client
-from influxdb_client.client.write_api import SYNCHRONOUS
-
 from pyarroyo import ArroyoClient, ArroyoError, LaserCondition, TECCondition
 from supervisor.supervisor_helper import log, log_error, log_warn
 
@@ -56,10 +53,9 @@ print()
 
 
 # >>> load IMAQ secret >>>
-AUTH = None
-if not ARGS.dry_run:
-    with open("imaq-secret/auth.toml", "rb") as f:
-        AUTH = tomllib.load(f)
+import tomllib
+with open("imaq-secret/auth.toml", "rb") as f:
+    AUTH = tomllib.load(f)
 # <<< load IMAQ secret <<<
 
 
@@ -72,10 +68,15 @@ for SIGNAL_NUMBER in (signal.SIGINT, signal.SIGTERM):
 
 
 # >>> InfluxDB configuration >>>
-INFLUXDB_CLIENT = None
-INFLUXDB_WRITE_API = None
-INFLUXDB_ORG = None
-INFLUXDB_BUCKET = None
+import influxdb_client
+from influxdb_client.client.write_api import SYNCHRONOUS
+# Initialize the InfluxDB Client and the Write API
+INFLUXDB_CLIENT = influxdb_client.InfluxDBClient(**AUTH["influxdb"])
+INFLUXDB_WRITE_API = INFLUXDB_CLIENT.write_api(write_options=SYNCHRONOUS)
+INFLUXDB_QUERY_API = INFLUXDB_CLIENT.query_api()
+INFLUXDB_ORG = AUTH["influxdb"]["org"]; INFLUXDB_BUCKET = AUTH["influxdb"]["bucket"]
+print(f"InfluxDB client initialized for org='{INFLUXDB_ORG}', bucket='{INFLUXDB_BUCKET}'.")
+print()
 # <<< InfluxDB configuration <<<
 
 
@@ -98,15 +99,6 @@ else:
 
 exit_code = 0
 try:
-    if AUTH is not None:
-        influxdb_options = dict(AUTH["influxdb"])
-        INFLUXDB_ORG = influxdb_options["org"]
-        INFLUXDB_BUCKET = influxdb_options.pop("bucket")
-        INFLUXDB_CLIENT = influxdb_client.InfluxDBClient(**influxdb_options)
-        INFLUXDB_WRITE_API = INFLUXDB_CLIENT.write_api(write_options=SYNCHRONOUS)
-        print("InfluxDB client initialized.")
-        print()
-
     SOURCE_CLIENT.connect()
     IDENTITY = SOURCE_CLIENT.identify()
     IDENTITY_KEY = (IDENTITY.manufacturer, IDENTITY.model, IDENTITY.serial_number)

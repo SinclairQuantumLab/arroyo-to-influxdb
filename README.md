@@ -12,7 +12,7 @@ the previously active channel before returning.
 
 - A powered Arroyo controller connected via USB virtual-COM, RS-232 port, or TCP endpoint.
 - Git and [`uv`](https://docs.astral.sh/uv/)
-- Access to the private `imaq-secret` repository for InfluxDB uploads
+- Access to the private `imaq-secret` repository
 
 ## Installation
 
@@ -80,7 +80,7 @@ the previously active channel before returning.
     default.
 
 4. Perform initial testing. First read the real controller and print the exact
-   records without loading InfluxDB credentials or contacting InfluxDB:
+   records without uploading them to InfluxDB:
 
     ```bash
     uv run python main.py --settings settings.toml --once --dry-run
@@ -97,9 +97,10 @@ the previously active channel before returning.
     uv run python main.py --settings settings.toml --once
     ```
 
-    The relay reads `imaq-secret/auth.toml` only when uploads are enabled.
-    Query the new points back from InfluxDB and verify the schema and timestamps
-    before starting continuous operation.
+    The relay loads `imaq-secret/auth.toml` and initializes the InfluxDB client
+    at startup, including in dry-run mode. Query the new points back from
+    InfluxDB and verify the schema and timestamps before starting continuous
+    operation.
 
 5. Optional: after foreground validation, install the matching template from
    `supervisor/`. It starts the prepared environment through `Startup.ps1` or
@@ -114,8 +115,8 @@ uv run python main.py --settings settings.toml
 ```
 
 `--settings PATH` defaults to `settings.toml`. `--once` performs one cycle and
-exits. `--dry-run` disables credential loading and InfluxDB access; it is valid
-with either one-shot or continuous operation.
+exits. `--dry-run` skips InfluxDB writes; it is valid with either one-shot or
+continuous operation.
 
 Stop a foreground process with `Ctrl+C`. Normal shutdown closes the Arroyo and
 InfluxDB clients but does not send `LOCAL` or another instrument command.

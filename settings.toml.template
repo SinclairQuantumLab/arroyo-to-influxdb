@@ -8,9 +8,9 @@ port = "<PORT>"          # e.g. "COM4" or "/dev/ttyUSB0"
 baudrate = 38400         # Arroyo USB virtual-COM default
 response_timeout_s = 1.0
 
-# To use direct TCP instead, remove [connection.serial] and use:
+# To connect through TCP, comment out [connection.serial] block above and use:
 # [connection.network]
-# host = "<HOST>"
+# host = "<HOST>" # e.g., "192.168.50.172"
 # port = 10001
 # connect_timeout_s = 3.0
 # response_timeout_s = 1.0

@@ -9,5 +9,8 @@ tmp/
 settings.toml
 logs/
 
+# IMAQ Lab secret repo
+imaq-secret/*
+
 # Vendor manuals are local protocol evidence; do not redistribute by default.
 Manuals/*.pdf

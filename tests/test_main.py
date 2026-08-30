@@ -257,6 +257,11 @@ class FakeInfluxClient:
         assert write_options is not None
         return self.api
 
+    def query_api(self) -> object:
+        """Return an unused query API placeholder."""
+
+        return object()
+
     def close(self) -> None:
         """Record client cleanup."""
 
@@ -397,15 +402,14 @@ def test_settings_template_is_valid_toml() -> None:
 
 
 def test_standard_configuration_and_influxdb_blocks_remain_literal() -> None:
-    """Keep the current HiCube relay's shared blocks byte-for-byte recognizable."""
+    """Copy the IMAQ secret README's shared blocks without modification."""
 
     source = SCRIPT_PATH.read_text(encoding="utf-8")
     assert (
         """# >>> load IMAQ secret >>>
-AUTH = None
-if not ARGS.dry_run:
-    with open("imaq-secret/auth.toml", "rb") as f:
-        AUTH = tomllib.load(f)
+import tomllib
+with open("imaq-secret/auth.toml", "rb") as f:
+    AUTH = tomllib.load(f)
 # <<< load IMAQ secret <<<
 
 
@@ -418,23 +422,16 @@ for SIGNAL_NUMBER in (signal.SIGINT, signal.SIGTERM):
 
 
 # >>> InfluxDB configuration >>>
-INFLUXDB_CLIENT = None
-INFLUXDB_WRITE_API = None
-INFLUXDB_ORG = None
-INFLUXDB_BUCKET = None
+import influxdb_client
+from influxdb_client.client.write_api import SYNCHRONOUS
+# Initialize the InfluxDB Client and the Write API
+INFLUXDB_CLIENT = influxdb_client.InfluxDBClient(**AUTH["influxdb"])
+INFLUXDB_WRITE_API = INFLUXDB_CLIENT.write_api(write_options=SYNCHRONOUS)
+INFLUXDB_QUERY_API = INFLUXDB_CLIENT.query_api()
+INFLUXDB_ORG = AUTH["influxdb"]["org"]; INFLUXDB_BUCKET = AUTH["influxdb"]["bucket"]
+print(f"InfluxDB client initialized for org='{INFLUXDB_ORG}', bucket='{INFLUXDB_BUCKET}'.")
+print()
 # <<< InfluxDB configuration <<<"""
-        in source
-    )
-    assert (
-        """    if AUTH is not None:
-        influxdb_options = dict(AUTH["influxdb"])
-        INFLUXDB_ORG = influxdb_options["org"]
-        INFLUXDB_BUCKET = influxdb_options.pop("bucket")
-        INFLUXDB_CLIENT = influxdb_client.InfluxDBClient(**influxdb_options)
-        INFLUXDB_WRITE_API = INFLUXDB_CLIENT.write_api(write_options=SYNCHRONOUS)
-        print("InfluxDB client initialized.")
-        print()
-"""
         in source
     )
 
@@ -449,7 +446,9 @@ def test_direct_script_constructs_selected_connection(
 
     monkeypatch.chdir(tmp_path)
     settings_path = write_settings(tmp_path, connection=connection)
+    write_auth(tmp_path)
     serial_calls, network_calls = use_fake_source(monkeypatch, FakeSource())
+    use_fake_influx(monkeypatch, FakeWriteAPI())
 
     exit_code, namespace = run_script(
         monkeypatch,
@@ -496,6 +495,7 @@ def test_direct_script_maps_and_uploads_the_complete_documented_schema(
         "url": "http://influxdb.example:8086",
         "token": "<SYNTHETIC_TEST_TOKEN>",
         "org": "lab",
+        "bucket": "devices",
         "verify_ssl": False,
     }
     bucket, org, records = write_api.writes[0]
@@ -571,24 +571,20 @@ def test_direct_script_maps_and_uploads_the_complete_documented_schema(
     assert source.close_count == write_api.close_count == created[0].close_count == 1
 
 
-def test_dry_run_skips_credentials_and_influxdb(
+def test_dry_run_skips_influxdb_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Read the source without opening auth.toml or constructing InfluxDB."""
+    """Initialize from shared credentials but do not write the acquired records."""
 
     monkeypatch.chdir(tmp_path)
     settings_path = write_settings(tmp_path)
+    write_auth(tmp_path)
     source = FakeSource()
     use_fake_source(monkeypatch, source)
-    monkeypatch.setattr(
-        influxdb_client,
-        "InfluxDBClient",
-        lambda **_options: (_ for _ in ()).throw(
-            AssertionError("InfluxDB constructed")
-        ),
-    )
+    write_api = FakeWriteAPI()
+    created = use_fake_influx(monkeypatch, write_api)
 
     exit_code, _namespace = run_script(
         monkeypatch,
@@ -597,7 +593,9 @@ def test_dry_run_skips_credentials_and_influxdb(
 
     assert exit_code == 0
     assert "Dry-run records, not uploaded" in capsys.readouterr().out
+    assert write_api.writes == []
     assert source.connect_count == source.close_count == 1
+    assert write_api.close_count == created[0].close_count == 1
 
 
 def test_source_failure_reconnects_reidentifies_and_retries_the_complete_batch(
@@ -608,11 +606,13 @@ def test_source_failure_reconnects_reidentifies_and_retries_the_complete_batch(
 
     monkeypatch.chdir(tmp_path)
     settings_path = write_settings(tmp_path)
+    write_auth(tmp_path)
     source = FakeSource(
         tec_outcomes=[tec_sample(), tec_sample()],
         laser_outcomes=[ArroyoCommunicationError("first laser read"), laser_sample()],
     )
     use_fake_source(monkeypatch, source)
+    use_fake_influx(monkeypatch, FakeWriteAPI())
 
     exit_code, _namespace = run_script(
         monkeypatch,
@@ -661,12 +661,14 @@ def test_changed_identity_after_reconnect_rejects_the_retry(
 
     monkeypatch.chdir(tmp_path)
     settings_path = write_settings(tmp_path)
+    write_auth(tmp_path)
     changed = InstrumentIdentity("Arroyo", "OTHER", "SERIAL", "1", "B", "raw")
     source = FakeSource(
         identities=[IDENTITY, changed],
         tec_outcomes=[ArroyoCommunicationError("disconnected")],
     )
     use_fake_source(monkeypatch, source)
+    use_fake_influx(monkeypatch, FakeWriteAPI())
 
     exit_code, _namespace = run_script(
         monkeypatch,
@@ -710,6 +712,7 @@ def test_lifetime_failure_count_does_not_reset_after_success(
 
     monkeypatch.chdir(tmp_path)
     settings_path = write_settings(tmp_path, interval_s=1)
+    write_auth(tmp_path)
     source = FakeSource(
         tec_outcomes=[
             ArroyoCommunicationError("cycle one"),
@@ -724,6 +727,7 @@ def test_lifetime_failure_count_does_not_reset_after_success(
     )
     stop_event = FakeStopEvent([0.0], stop_after_waits=99)
     use_fake_source(monkeypatch, source)
+    use_fake_influx(monkeypatch, FakeWriteAPI())
     monkeypatch.setattr(threading, "Event", lambda: stop_event)
 
     exit_code, _namespace = run_script(
@@ -745,6 +749,7 @@ def test_scheduler_uses_cycle_start_deadlines_and_skips_catch_up_reads(
 
     monkeypatch.chdir(tmp_path)
     settings_path = write_settings(tmp_path, interval_s=10)
+    write_auth(tmp_path)
     clock = [0.0]
     durations = [3.0, 12.0]
 
@@ -758,6 +763,7 @@ def test_scheduler_uses_cycle_start_deadlines_and_skips_catch_up_reads(
     )
     stop_event = FakeStopEvent(clock, stop_after_waits=2)
     use_fake_source(monkeypatch, source)
+    use_fake_influx(monkeypatch, FakeWriteAPI())
     monkeypatch.setattr(threading, "Event", lambda: stop_event)
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
 
