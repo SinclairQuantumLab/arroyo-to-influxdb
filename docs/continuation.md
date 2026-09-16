@@ -4,7 +4,7 @@ This is the durable handoff for a new thread, maintainer, or autonomous agent.
 It records what has been settled, what is verified, and what remains gated so
 work can continue without reconstructing the project from conversation history.
 
-Last reviewed: 2026-08-30.
+Last reviewed: 2026-09-16 (signal shutdown and offline relay checks).
 
 ## Current snapshot
 
@@ -15,7 +15,7 @@ Last reviewed: 2026-08-30.
 | Credential source | Private `imaq-secret` Git submodule; never inspect or copy its credential values into maintained artifacts |
 | Runtime | Python 3.11+, uv-managed environment, synchronous direct top-level relay |
 | Measurement | Fixed `arroyo`; exact schema is the contract in the root README |
-| Offline relay evidence | 15 whole-script tests pass; targeted Ruff checks pass with the literal shared-block exceptions described below |
+| Offline relay evidence | 21 whole-script tests pass; targeted Ruff checks pass with the literal shared-block exceptions described below |
 | Offline library evidence | Ruff passes, 347 tests pass, and all 296 catalog forms audit consistently; 290 forms are implemented through 215 static entities |
 | Live source evidence | None; no attached Arroyo controller has been read in this workspace |
 | Live upload evidence | None; no InfluxDB write or query-back has been authorized or recorded |
@@ -64,8 +64,10 @@ Supervisor activation.
 - Polling uses monotonic cycle-start deadlines. Acquisition time is subtracted
   from the wait; an overrun waits one full interval rather than issuing a
   catch-up read.
-- SIGINT/SIGTERM request a graceful stop. Cleanup closes the source, write API,
-  and InfluxDB client but deliberately does not send `LOCAL`.
+- SIGINT/SIGTERM invoke `signal.default_int_handler`, interrupt current work
+  with `KeyboardInterrupt`, and exit 130 after `finally` cleanup. The source,
+  write API, and InfluxDB client are closed without sending `LOCAL`. There is
+  no signal-handler lock or requirement to finish the current polling cycle.
 
 ## Literal shared configuration blocks
 
@@ -124,7 +126,7 @@ uv run ruff check tests supervisor
 uv run ruff check main.py --ignore E402,I001,E702
 ```
 
-The last handoff run produced 15 passing relay tests. Full `uv run ruff check .`
+The September 16 signal-shutdown run produced 21 passing relay tests. Full `uv run ruff check .`
 reports six known findings in `main.py`: mid-file/import-order findings `E402`
 and `I001`, plus semicolon finding `E702`. They arise only from the mandatory
 literal IMAQ blocks. Do not auto-fix those blocks; all other checked parent code

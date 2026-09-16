@@ -6,7 +6,6 @@ import ast
 import runpy
 import signal
 import sys
-import threading
 import time
 import tomllib
 from collections.abc import Callable
@@ -268,34 +267,21 @@ class FakeInfluxClient:
         self.close_count += 1
 
 
-class FakeStopEvent:
-    """Stop continuous runs after deterministic waits."""
+class FakeSleep:
+    """Advance a deterministic clock, then interrupt after the selected waits."""
 
     def __init__(self, clock: list[float], *, stop_after_waits: int) -> None:
         """Share one monotonic clock and configure the wait limit."""
-
         self.clock = clock
         self.stop_after_waits = stop_after_waits
         self.waits: list[float] = []
-        self.requested = False
 
-    def set(self) -> None:
-        """Record a signal-driven stop request."""
-
-        self.requested = True
-
-    def is_set(self) -> bool:
-        """Report a signal request or exhausted wait allowance."""
-
-        return self.requested or len(self.waits) >= self.stop_after_waits
-
-    def wait(self, timeout: float | None = None) -> bool:
-        """Record a wait and advance the shared clock."""
-
-        assert timeout is not None
-        self.waits.append(timeout)
-        self.clock[0] += timeout
-        return self.is_set()
+    def sleep(self, seconds: float) -> None:
+        """Record elapsed waiting and model Ctrl+C at the final boundary."""
+        self.waits.append(seconds)
+        self.clock[0] += seconds
+        if len(self.waits) >= self.stop_after_waits:
+            raise KeyboardInterrupt
 
 
 def use_fake_source(
@@ -343,12 +329,15 @@ def use_fake_influx(
 def run_script(
     monkeypatch: pytest.MonkeyPatch,
     arguments: list[str],
+    *,
+    signal_handlers: dict | None = None,
 ) -> tuple[int, dict[str, object]]:
     """Execute the production file as a script and capture its exit result."""
 
     monkeypatch.syspath_prepend(str(SCRIPT_PATH.parent))
     monkeypatch.setattr(sys, "argv", [str(SCRIPT_PATH), *arguments])
-    monkeypatch.setattr(signal, "signal", lambda _number, _handler: None)
+    handlers = {} if signal_handlers is None else signal_handlers
+    monkeypatch.setattr(signal, "signal", handlers.__setitem__)
     try:
         namespace: dict[str, object] = runpy.run_path(
             str(SCRIPT_PATH), run_name="__main__"
@@ -410,18 +399,11 @@ def test_standard_configuration_and_influxdb_blocks_remain_literal() -> None:
 import tomllib
 with open("imaq-secret/auth.toml", "rb") as f:
     AUTH = tomllib.load(f)
-# <<< load IMAQ secret <<<
-
-
-STOP_EVENT = threading.Event()
-for SIGNAL_NUMBER in (signal.SIGINT, signal.SIGTERM):
-    try:
-        signal.signal(SIGNAL_NUMBER, lambda _signum, _frame: STOP_EVENT.set())
-    except (OSError, RuntimeError, ValueError):
-        pass
-
-
-# >>> InfluxDB configuration >>>
+# <<< load IMAQ secret <<<"""
+        in source
+    )
+    assert (
+        """# >>> InfluxDB configuration >>>
 import influxdb_client
 from influxdb_client.client.write_api import SYNCHRONOUS
 # Initialize the InfluxDB Client and the Write API
@@ -725,10 +707,10 @@ def test_lifetime_failure_count_does_not_reset_after_success(
         ],
         laser_outcomes=[laser_sample()],
     )
-    stop_event = FakeStopEvent([0.0], stop_after_waits=99)
+    sleeper = FakeSleep([0.0], stop_after_waits=99)
     use_fake_source(monkeypatch, source)
     use_fake_influx(monkeypatch, FakeWriteAPI())
-    monkeypatch.setattr(threading, "Event", lambda: stop_event)
+    monkeypatch.setattr(time, "sleep", sleeper.sleep)
 
     exit_code, _namespace = run_script(
         monkeypatch,
@@ -761,10 +743,10 @@ def test_scheduler_uses_cycle_start_deadlines_and_skips_catch_up_reads(
         laser_outcomes=[laser_sample(), laser_sample()],
         on_laser_read=advance_work,
     )
-    stop_event = FakeStopEvent(clock, stop_after_waits=2)
+    sleeper = FakeSleep(clock, stop_after_waits=2)
     use_fake_source(monkeypatch, source)
     use_fake_influx(monkeypatch, FakeWriteAPI())
-    monkeypatch.setattr(threading, "Event", lambda: stop_event)
+    monkeypatch.setattr(time, "sleep", sleeper.sleep)
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
 
     exit_code, _namespace = run_script(
@@ -772,8 +754,8 @@ def test_scheduler_uses_cycle_start_deadlines_and_skips_catch_up_reads(
         ["--settings", str(settings_path), "--dry-run"],
     )
 
-    assert exit_code == 0
-    assert stop_event.waits == [7.0, 10.0]
+    assert exit_code == 130
+    assert sleeper.waits == [7.0, 10.0]
     assert source.close_count == 1
 
 
@@ -797,3 +779,47 @@ def test_startup_and_supervisor_files_preserve_service_contract() -> None:
         assert "startsecs=5" in config
         assert "startretries=5" in config
         assert "autorestart=unexpected" in config
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+@pytest.mark.parametrize("phase", ["read", "upload", "sleep"])
+def test_termination_interrupts_work_and_closes_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    signum: int,
+    phase: str,
+) -> None:
+    """Use the registered handler at I/O boundaries without touching hardware."""
+    settings_path = write_settings(tmp_path)
+    write_auth(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    handlers = {}
+
+    def interrupt(*args: object, **kwargs: object) -> None:
+        """Deliver the selected signal through the production registration."""
+        assert handlers[signum] is signal.default_int_handler
+        handlers[signum](signum, None)
+
+    source_client = FakeSource(
+        tec_outcomes=[tec_sample()],
+        laser_outcomes=[laser_sample()],
+        on_laser_read=interrupt if phase == "read" else None,
+    )
+    write_api = FakeWriteAPI()
+    use_fake_source(monkeypatch, source_client)
+    created = use_fake_influx(monkeypatch, write_api)
+    if phase == "upload":
+        monkeypatch.setattr(write_api, "write", interrupt)
+    monkeypatch.setattr(time, "sleep", interrupt)
+
+    exit_code, _ = run_script(
+        monkeypatch,
+        ["--settings", str(settings_path)],
+        signal_handlers=handlers,
+    )
+
+    assert exit_code == 130
+    assert len(write_api.writes) == (1 if phase == "sleep" else 0)
+    assert source_client.close_count == created[0].close_count == 1
+    assert source_client.reconnect_count == 0
+    assert write_api.close_count == 1

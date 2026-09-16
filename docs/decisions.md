@@ -46,7 +46,10 @@ and the continuation handoff together.
     failure.
 11. Scheduling uses monotonic cycle-start deadlines and skips catch-up reads
     after an overrun. Shutdown closes both clients and the write API but does
-    not send `LOCAL` or another instrument command.
+    not send `LOCAL` or another instrument command. Since the user-approved
+    2026-09-16 change, SIGINT/SIGTERM use `signal.default_int_handler`;
+    `KeyboardInterrupt` skips polling retries, executes `finally`, and exits
+    130. Signal handlers do not use `threading.Event` or other locks.
 12. The root README is the operator manual. Keep installation, initial dry-run
     and upload testing, continuous usage, exact schema, deployment mention,
     validation status, and troubleshooting there. Contributor context belongs

@@ -118,6 +118,12 @@ uv run python main.py --settings settings.toml
 exits. `--dry-run` skips InfluxDB writes; it is valid with either one-shot or
 continuous operation.
 
+`Ctrl+C` (SIGINT) and SIGTERM use Python's `signal.default_int_handler`:
+they interrupt the current read, upload, or sleep through `KeyboardInterrupt`
+and run the existing `finally` cleanup (exit code 130). Shutdown does not wait
+for a complete polling cycle. An interrupted upload may already have reached
+InfluxDB; it is not retried during shutdown.
+
 Stop a foreground process with `Ctrl+C`. Normal shutdown closes the Arroyo and
 InfluxDB clients but does not send `LOCAL` or another instrument command.
 
@@ -254,7 +260,7 @@ evidence gaps rather than silently added to the public contract. None of those
 forms is used by this relay; see
 [`pyarroyo/docs/command-evidence.md`](pyarroyo/docs/command-evidence.md).
 
-The relay has 15 offline whole-script tests covering its settings, both
+The relay has 21 offline whole-script tests covering its settings, both
 connection factories, exact TEC/laser schema, timestamps, complete batches,
 recovery, identity continuity, failure accounting, polling deadlines, cleanup,
 and startup/Supervisor contracts. No attached Arroyo controller, InfluxDB
